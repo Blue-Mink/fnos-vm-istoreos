@@ -113,18 +113,65 @@ QCOW2_FILE="${SHARE_PATH}/istoreos.qcow2"
 POOL_NAME="vol1"
 POOL_PATH="/vol1/vm/pool"
 POOL_QCOW2="${POOL_PATH}/istoreos.qcow2"
+# 磁盘里装的是哪个版本，记在这个标记文件里。位置不能在池目录内——
+# 目录型存储池会把多出来的文件当成卷列出来，虚拟机界面会冒出乱七八糟的磁盘。
+DISK_MARK_FILE="/vol1/vm/istoreos.disk-version"
+DISK_BACKUP_DIR="/vol1/vm/backup"
 
-# ---- 步骤1: 下载官方镜像（重试3次）----
-if [ -s "${QCOW2_FILE}" ]; then
+# 已有磁盘里是什么系统版本：先读标记；老装机没标记，就退回虚拟机定义里的
+# osVersion（装机时写进去的，与虚拟机界面显示的同源）。都拿不到返回空。
+existing_disk_version() {
+    if [ -s "${DISK_MARK_FILE}" ]; then
+        head -n1 "${DISK_MARK_FILE}" | tr -d ' \t\r'
+        return 0
+    fi
+    virsh -c qemu:///system dumpxml "${VM_NAME}" 2>/dev/null | \
+        sed -n 's:.*<osVersion[^>]*>iStoreOS \([0-9.]\{1,\}\).*:\1:p' | head -1
+}
+
+# ---- 步骤1: 已有磁盘的判断（复用 / 换版本留档），没有磁盘才下载 ----
+# 置全局 SKIP_PROV（1=本轮不重装磁盘）、QCOW2_FILE（本轮要用的磁盘路径）
+handle_existing_disk() {
+    HAVE_DISK=""
+    [ -s "${QCOW2_FILE}" ] && HAVE_DISK="${QCOW2_FILE}"
+    if [ -z "${HAVE_DISK}" ] && [ -s "${POOL_QCOW2}" ]; then
+        HAVE_DISK="${POOL_QCOW2}"
+    fi
+    if [ -z "${HAVE_DISK}" ]; then
+        return 0
+    fi
+    DISK_VER="$(existing_disk_version)"
+    if [ -n "${DISK_VER}" ] && [ "${DISK_VER}" != "${ISTO_VERSION}" ]; then
+        # 向导里明确选了另一个版本，就得真的换系统：旧盘整块改名留档，再灌所选版本。
+        # 1.1.2 及之前在这里无条件复用旧盘，版本选择被丢掉，装完还是原来的系统。
+        CUR="换版本留档旧盘"; set_state "swap-disk ${DISK_VER}->${ISTO_VERSION}"
+        echo ">>> 步骤1: 磁盘里是 ${DISK_VER}，本次要装 ${ISTO_VERSION} → 换盘"
+        mkdir -p "${DISK_BACKUP_DIR}"
+        SWAP_FILE="${DISK_BACKUP_DIR}/istoreos.qcow2.swap-${DISK_VER}-$(date +%Y%m%d%H%M%S)"
+        mv "${HAVE_DISK}" "${SWAP_FILE}"
+        echo "    旧盘已留档：${SWAP_FILE}"
+        rm -f "${DISK_MARK_FILE}"
+        virsh pool-refresh "${POOL_NAME}" 2>/dev/null || true
+        return 0
+    fi
     CUR="复用已有磁盘"; set_state "reuse-disk"
-echo ">>> 步骤1: 跳过下载（已存在预置后的 ${QCOW2_FILE}）"
+    echo ">>> 步骤1: 跳过下载（复用 ${HAVE_DISK}，磁盘版本=${DISK_VER:-未知}）"
+    if [ -z "${DISK_VER}" ]; then
+        echo "    ⚠️ 判断不出这块磁盘里的系统版本（缺版本标记），按原样保留不覆盖"
+    fi
+    QCOW2_FILE="${HAVE_DISK}"
     SKIP_PROV=1
-elif [ -s "${POOL_QCOW2}" ]; then
-    CUR="复用存储池磁盘"; set_state "reuse-disk"
-echo ">>> 步骤1: 跳过下载（存储池已有预置后的 ${POOL_QCOW2}，重装保持原盘）"
-    QCOW2_FILE="${POOL_QCOW2}"
-    SKIP_PROV=1
-else
+    if [ ! -s "${DISK_MARK_FILE}" ] && [ -n "${DISK_VER}" ]; then
+        echo "${DISK_VER}" > "${DISK_MARK_FILE}"
+        echo "    补写版本标记：${DISK_MARK_FILE} = ${DISK_VER}"
+    fi
+}
+
+SKIP_PROV=0
+DISK_VER=""
+handle_existing_disk
+
+if [ "${SKIP_PROV}" != "1" ]; then
     CUR="下载镜像 v${ISTO_VERSION}"; set_state "downloading ${ISTO_VERSION}"
 echo ">>> 步骤1: 下载 iStoreOS v${ISTO_VERSION} (约240MB)"
     cd "${SHARE_PATH}"
@@ -197,6 +244,8 @@ echo ">>> 步骤5: 网络预置（LAN→DHCP客户端 / 关闭自身DHCP与RA）
     fi
     echo "✅ 网络预置完成"
     SKIP_PROV=0
+    echo "${ISTO_VERSION}" > "${DISK_MARK_FILE}"
+    echo ">>> 记录磁盘版本标记：${DISK_MARK_FILE} = ${ISTO_VERSION}"
 fi
 
 # ---- 清理中间文件（保留预置后的 qcow2）----

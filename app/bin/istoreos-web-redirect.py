@@ -38,6 +38,9 @@ TARGET_PORT = int(os.environ.get("ISTO_TARGET_PORT", "80"))
 MDNS_NAMES = os.environ.get("ISTO_MDNS_NAMES", "istoreos.local openwrt.local").split()
 CACHE_TTL = 20
 SWEEP_COOLDOWN = 45
+# 与 cmd/main 共用的两个状态文件：开机请求登记 / 用户主动停用标记
+START_REQ = "/tmp/istoreos-vm-start.req"
+STOP_MARK = "/tmp/istoreos-user-stopped"
 FP_MARKERS = (b"istoreos", b"istore", b"luci")
 
 _lock = threading.Lock()
@@ -72,6 +75,17 @@ def vm_defined():
 
 def vm_power_on():
     """一键/自动开机：shut off→start，paused→resume，running→幂等。返回状态描述。"""
+    # 登记开机请求：cmd/main 的关机守望进程据此放弃强制断电（并在关机落定后补开）；
+    # 同时撤销「用户停用」标记，否则应用中心会把这个窗口误判成未运行/异常。
+    try:
+        with open(START_REQ, "w"):
+            pass
+    except OSError:
+        pass
+    try:
+        os.remove(STOP_MARK)
+    except OSError:
+        pass
     st = _sh(f"virsh -c qemu:///system domstate {VM_NAME}", 8)
     if "running" in st:
         return "already-running"
@@ -239,17 +253,27 @@ def httpfp_fallback():
 
 
 def resolve_ip():
+    """找虚拟机地址。返回 dict，不只是"有没有 IP"：
+      ip      探活通过、可以直接跳过去的地址（没有就 None）
+      source  发现层（mac+arp / mdns / domifaddr / sweep+arp / httpfp）
+      stage   ok / web-warming（找到地址但 80 还没通）/ no-ip（开好了没地址）/ stopped
+      probing 探活没通过的那个候选地址，纯给排障看
+      mac     虚拟机网卡 MAC，排障用
+    以前只回 (ip, source)，于是「没开机」「开好了但没 IP」「有 IP 但 Web 没起」
+    三种完全不同的情况在入口页都是同一句"正在启动"，出问题只能靠串口。
+    """
     now = time.time()
     with _lock:
-        # 缓存命中：TCP 快速验证后直接采用
-        if (_cache["ip"] and now - _cache["ts"] < CACHE_TTL
-                and vm_running()
-                and mac_ok_for(_cache["ip"])
-                and tcp_open(_cache["ip"], TARGET_PORT)):
-            return _cache["ip"], _cache["source"]
         if not vm_running():
             _cache["ip"] = None
-            return None, "stopped"
+            return {"ip": None, "source": None, "stage": "stopped",
+                    "probing": None, "mac": vm_mac()}
+        # 缓存命中：TCP 快速验证后直接采用
+        if (_cache["ip"] and now - _cache["ts"] < CACHE_TTL
+                and mac_ok_for(_cache["ip"])
+                and tcp_open(_cache["ip"], TARGET_PORT)):
+            return {"ip": _cache["ip"], "source": _cache["source"], "stage": "ok",
+                    "probing": None, "mac": _cache["mac"]}
         mac = vm_mac()
         # 1) MAC → ARP
         ip = arp_lookup(mac)
@@ -273,16 +297,21 @@ def resolve_ip():
         if not ip:
             ip = httpfp_fallback()
             source = "httpfp" if ip else None
+        probing = None
         if ip and not tcp_open(ip, TARGET_PORT):
             # ARP 表/DHCP 租约里的地址可能是上一次开机留下的，
             # 虚拟机还在起 Web 服务时跳过去就是 ERR_ADDRESS_UNREACHABLE，
             # 因此端口没通就当没找到，让入口页继续 5 秒轮询。
-            ip = None
+            # 注意：地址作废时 source 也得一起作废，否则 /api/status 会出现
+            # {"ip": null, "source": "mac+arp"} 这种自相矛盾的排障线索。
+            probing, ip, source = ip, None, None
         if ip:
             _cache.update(ip=ip, mac=mac, ts=now, source=source)
-        else:
-            _cache["ip"] = None
-        return ip, source
+            return {"ip": ip, "source": source, "stage": "ok",
+                    "probing": None, "mac": mac}
+        _cache["ip"] = None
+        return {"ip": None, "source": None, "stage": "web-warming" if probing else "no-ip",
+                "probing": probing, "mac": mac}
 
 
 PAGE_TMPL = """<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">\
@@ -304,6 +333,21 @@ color:#fff;cursor:pointer;letter-spacing:1px}button:hover{background:#3b76f0}\
 
 
 STATE_FILE = "/tmp/istoreos-install.state"
+DISK_MARK_FILE = "/vol1/vm/istoreos.disk-version"
+
+
+def os_version():
+    """磁盘里的 iStoreOS 版本：装机时写的标记，退回虚拟机定义里的 osVersion。"""
+    try:
+        with open(DISK_MARK_FILE) as f:
+            v = f.readline().strip()
+            if v:
+                return v
+    except OSError:
+        pass
+    xml = _sh(f"virsh -c qemu:///system dumpxml {VM_NAME}", 8)
+    m = re.search(r"<osVersion[^>]*>iStoreOS ([0-9.]+)", xml)
+    return m.group(1) if m else None
 
 
 def install_state():
@@ -341,9 +385,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send(200, b"ok", "text/plain")
             return
         if pure == "/api/status":
-            ip, source = resolve_ip()
+            r = resolve_ip()
             payload = json.dumps(
-                {"running": bool(ip) or vm_running(), "ip": ip, "source": source,
+                {"running": bool(r["ip"]) or vm_running(), "ip": r["ip"],
+                 "source": r["source"], "stage": r["stage"], "probing": r["probing"],
+                 "mac": r["mac"], "os_version": os_version(),
                  "target_port": TARGET_PORT, "install_state": install_state()},
                 ensure_ascii=False,
             ).encode("utf-8")
@@ -358,13 +404,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             return
-        ip, _src = resolve_ip()
-        if ip:
+        r = resolve_ip()
+        if r["ip"]:
             tail = pure or "/"
             if "?" in path:
                 tail += "?" + path.split("?", 1)[1]
             self.send_response(302)
-            self.send_header("Location", f"http://{ip}:{TARGET_PORT}{tail}")
+            self.send_header("Location", f"http://{r['ip']}:{TARGET_PORT}{tail}")
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             return
@@ -374,17 +420,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "正在准备",
                 f"首次安装约需 3~8 分钟<br><code>{st}</code>", refresh=5, dot="wait"))
             return
-        if not vm_running():
-            if vm_defined():
-                btn = ('<form method="POST" action="/power/start">'
-                       '<button type="submit">启动虚拟机</button></form>')
-                self._send(200, self._page("iStoreOS 已关机", btn, refresh=5))
-            else:
-                self._send(200, self._page(
-                    "准备中", "正在等待应用完成安装。", refresh=5, dot="wait"))
-        else:
+        if not vm_defined():
+            self._send(200, self._page(
+                "准备中", "正在等待应用完成安装。", refresh=5, dot="wait"))
+            return
+        if r["stage"] == "stopped":
+            # 虚拟机关着：打开入口就顺手补开机。应用中心的「启用」不会回调应用
+            # 脚本（实测 cmd/main 只收到 stop），停用后想再用只能靠这一脚。
+            vm_power_on()
             self._send(200, self._page(
                 "正在启动", "iStoreOS 就绪后会自动打开。", refresh=5, dot="wait"))
+            return
+        if r["stage"] == "web-warming":
+            self._send(200, self._page(
+                "正在启动",
+                f"已找到 <code>{r['probing']}</code>，iStoreOS 的 Web 服务还在起来。",
+                refresh=5, dot="wait"))
+            return
+        # 虚拟机开着却始终没有可用地址：多半是路由器 DHCP 没发地址，
+        # 这句得说清楚，否则只能连串口看。
+        self._send(200, self._page(
+            "正在获取地址",
+            f"虚拟机已开机，iStoreOS 还在获取 IP（网卡 <code>{r['mac'] or '未知'}</code>）。"
+            f"<br>几分钟后仍无地址，请检查路由器 DHCP。",
+            refresh=5, dot="wait"))
 
     def do_POST(self):
         pure = self.path.split("?")[0]

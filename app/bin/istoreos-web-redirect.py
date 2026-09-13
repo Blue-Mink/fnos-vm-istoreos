@@ -4,7 +4,12 @@
 
 监听 NAS 固定端口（默认 36125），为应用中心/桌面图标提供固定入口：
   · GET /...        → 302 到 http://<VM_IP>:80/...（iStoreOS 管理界面）
+  · GET /power/start→ 302 回本站 "/"（开机接口只认 POST，见 do_GET 注释）
+  · POST /power/start→ 虚拟机关机页的一键开机，回页每 5 秒刷新回 "/"
   · GET /api/status → JSON 状态
+
+跳转前提：解析到的地址必须 TCP:80 探活通过，否则留在寻踪页继续轮询，
+避免 ARP 残留/DHCP 旧租约把浏览器甩到一个不通的地址。
 
 虚拟机 IP 多级发现链（找到即缓存 20s，缓存命中先做 TCP 快速验证）：
   1. libvirt XML 的 MAC → /proc/net/arp 反查（最准）
@@ -59,6 +64,24 @@ def tcp_open(ip, port, timeout=0.5):
 
 def vm_running():
     return "running" in _sh(f"virsh -c qemu:///system domstate {VM_NAME}", 8)
+
+
+def vm_defined():
+    return bool(_sh(f"virsh -c qemu:///system dominfo {VM_NAME}", 8).strip())
+
+
+def vm_power_on():
+    """一键/自动开机：shut off→start，paused→resume，running→幂等。返回状态描述。"""
+    st = _sh(f"virsh -c qemu:///system domstate {VM_NAME}", 8)
+    if "running" in st:
+        return "already-running"
+    if not vm_defined():
+        return "undefined"
+    if "paused" in st:
+        _sh(f"virsh -c qemu:///system resume {VM_NAME}", 15)
+        return "resumed"
+    _sh(f"virsh -c qemu:///system start {VM_NAME}", 20)
+    return "starting"
 
 
 def vm_mac():
@@ -250,6 +273,11 @@ def resolve_ip():
         if not ip:
             ip = httpfp_fallback()
             source = "httpfp" if ip else None
+        if ip and not tcp_open(ip, TARGET_PORT):
+            # ARP 表/DHCP 租约里的地址可能是上一次开机留下的，
+            # 虚拟机还在起 Web 服务时跳过去就是 ERR_ADDRESS_UNREACHABLE，
+            # 因此端口没通就当没找到，让入口页继续 5 秒轮询。
+            ip = None
         if ip:
             _cache.update(ip=ip, mac=mac, ts=now, source=source)
         else:
@@ -259,16 +287,20 @@ def resolve_ip():
 
 PAGE_TMPL = """<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">\
 <meta name="viewport" content="width=device-width,initial-scale=1">\
-$REFRESH<title>iStoreOS · IP 寻踪</title><style>\
-body{font-family:system-ui,'PingFang SC','Microsoft YaHei',sans-serif;\
-background:#0f1720;color:#e6edf3;display:flex;align-items:center;\
-justify-content:center;min-height:100vh;margin:0}\
-.c{max-width:520px;padding:40px 32px;background:#18222e;border-radius:16px;\
-box-shadow:0 8px 30px rgba(0,0,0,.4);text-align:center}\
-h1{font-size:22px;margin:0 0 12px}p{color:#9fb0c0;line-height:1.7;margin:8px 0}\
-code{background:#0d1520;padding:2px 8px;border-radius:6px;color:#7fd1ae}\
-.s{margin-top:18px;font-size:13px;color:#5c6f80}</style></head>\
-<body><div class="c">$BODY<div class="s">端口 $PORT · 目标 :$TARGET / 固定入口，地址变化自动跟随</div></div></body></html>"""
+$REFRESH<title>iStoreOS</title><style>\
+*{box-sizing:border-box}body{font-family:system-ui,'PingFang SC','Microsoft YaHei',sans-serif;\
+background:#0b1117;color:#e6edf3;display:flex;align-items:center;justify-content:center;\
+min-height:100vh;margin:0;-webkit-font-smoothing:antialiased}\
+.c{text-align:center;max-width:420px;padding:24px}\
+.dot{width:10px;height:10px;border-radius:50%;background:#4b5b6b;display:block;margin:0 auto 22px}\
+.dot.wait{background:#e8a03a;animation:br 1.6s ease-in-out infinite}\
+@keyframes br{50%{opacity:.35}}\
+h1{font-size:20px;font-weight:600;margin:0 0 10px;letter-spacing:.5px}\
+p{color:#8296a8;font-size:14px;margin:0 0 24px;line-height:1.7}\
+code{font-size:12px;color:#5f7385;background:#131c26;padding:2px 8px;border-radius:6px}\
+button{font-size:15px;padding:11px 34px;border-radius:999px;border:0;background:#2563eb;\
+color:#fff;cursor:pointer;letter-spacing:1px}button:hover{background:#3b76f0}\
+</style></head><body><div class="c">$BODY</div></body></html>"""
 
 
 STATE_FILE = "/tmp/istoreos-install.state"
@@ -295,9 +327,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(body)
 
-    def _page(self, title, msg, refresh=0):
+    def _page(self, title, msg, refresh=0, dot=""):
         rf = f'<meta http-equiv="refresh" content="{refresh}">' if refresh else ""
-        body = f"<h1>🧭 {title}</h1><p>{msg}</p>"
+        body = f'<span class="dot {dot}"></span><h1>{title}</h1><p>{msg}</p>'
         html = PAGE_TMPL.replace("$REFRESH", rf).replace("$BODY", body)
         html = html.replace("$PORT", str(PORT)).replace("$TARGET", str(TARGET_PORT))
         return html.encode("utf-8")
@@ -317,6 +349,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             ).encode("utf-8")
             self._send(200, payload, "application/json; charset=utf-8")
             return
+        if pure == "/power/start":
+            # 开机接口只认 POST。浏览器停在 /power/start 时刷新、后退或
+            # meta refresh 都会走到这里，若交给下面的透传逻辑就会被原样
+            # 镜像成 http://<VM_IP>/power/start（虚拟机上没这个页面）。
+            self.send_response(302)
+            self.send_header("Location", "/")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            return
         ip, _src = resolve_ip()
         if ip:
             tail = pure or "/"
@@ -330,20 +371,40 @@ class Handler(http.server.BaseHTTPRequestHandler):
         st = install_state()
         if st and st != "ready":
             self._send(200, self._page(
-                "后台初始化进行中",
-                "首次安装会在后台下载官方镜像并完成网络预置，通常 3~8 分钟。<br>"
-                f"当前进度：<code>{st}</code><br>本页面每 5 秒自动重试。", refresh=5))
+                "正在准备",
+                f"首次安装约需 3~8 分钟<br><code>{st}</code>", refresh=5, dot="wait"))
             return
         if not vm_running():
-            self._send(200, self._page(
-                "虚拟机未在运行",
-                "请先在 <b>「虚拟机」应用</b> 中启动 <code>istoreos</code> 虚拟机。"
-                "本页面每 5 秒自动重试。", refresh=5))
+            if vm_defined():
+                btn = ('<form method="POST" action="/power/start">'
+                       '<button type="submit">启动虚拟机</button></form>')
+                self._send(200, self._page("iStoreOS 已关机", btn, refresh=5))
+            else:
+                self._send(200, self._page(
+                    "准备中", "正在等待应用完成安装。", refresh=5, dot="wait"))
         else:
             self._send(200, self._page(
-                "已运行，正在寻踪 IP…",
-                "刚启动时获取 DHCP 地址需要一点时间。"
-                "寻踪会自动尝试 MAC/ARP、mDNS 与 HTTP 指纹，每 5 秒重试。", refresh=5))
+                "正在启动", "iStoreOS 就绪后会自动打开。", refresh=5, dot="wait"))
+
+    def do_POST(self):
+        pure = self.path.split("?")[0]
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            if length:
+                self.rfile.read(length)
+        except ValueError:
+            pass
+        if pure == "/power/start":
+            res = vm_power_on()
+            msg = {"starting": "iStoreOS 就绪后会自动打开。",
+                   "resumed": "iStoreOS 就绪后会自动打开。",
+                   "already-running": "iStoreOS 已在运行。",
+                   "undefined": "正在等待应用完成安装。"}[res]
+            # 刷新必须显式回到 "/"：只写 content="5" 会拿当前 URL
+            # （/power/start）重新 GET，等于把控制路径跳给虚拟机。
+            self._send(200, self._page("正在启动", msg, refresh="5;url=/", dot="wait"))
+            return
+        self._send(404, b"not found", "text/plain")
 
     do_HEAD = do_GET
 

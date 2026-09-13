@@ -1,12 +1,70 @@
 #!/bin/bash
 # iStoreOS 应用生命周期入口
-# - start/stop/status 管理「IP 寻踪」转发器（应用中心「打开」按钮的落点）
-# - 虚拟机本身的开机自启由安装向导配置（libvirt autostart），启停也可在「虚拟机」应用操作
+# - start：拉起「IP 寻踪」转发器 + 虚拟机开机（应用启用 = 虚拟机跟着启动）
+# - stop ：发 ACPI 优雅关机后立即返回，收尾交给后台守望（watch-shutdown）
+#          —— 停用不能阻塞 60 秒：实测阻塞期间平台状态机会把随后的「启动」
+#          判成 already started 直接跳过 main，虚拟机再也起不来（2026-09-13）
+# - 虚拟机也可随时在「虚拟机」应用独立操作；autostart 仍由安装向导选项决定
 UNIT="istoreos-web"
+DOM="virsh -c qemu:///system"
+VM="istoreos"
+STOP_WATCH="/tmp/istoreos-vm-stop.watch"
+# 用户主动「停用」的标记：只在停用期间让 status 报未运行，其余场景一律报健康
+STOP_MARK="/tmp/istoreos-user-stopped"
+
+isto_domstate() { $DOM domstate "$VM" 2>/dev/null; }
+
+isto_watch_alive() {
+    [ -f "${STOP_WATCH}" ] && kill -0 "$(cat "${STOP_WATCH}" 2>/dev/null)" 2>/dev/null
+}
+
+isto_vm_start() {
+    $DOM dominfo "$VM" >/dev/null 2>&1 || { echo "虚拟机尚未定义（安装未完成时属正常）"; return 0; }
+    # 上一次优雅关机还没落定时先等它停稳，否则 virsh start 会撞「正在关机」
+    if isto_watch_alive; then
+        echo "上一次优雅关机仍在收尾，等待落定…"
+        i=0
+        while [ "$i" -lt 12 ] && isto_watch_alive; do sleep 5; i=$((i+1)); done
+    fi
+    case "$(isto_domstate)" in
+        running)  echo "虚拟机已在运行"; return 0 ;;
+        paused)   $DOM resume "$VM" >/dev/null 2>&1 && echo "虚拟机已从挂起恢复"; return 0 ;;
+    esac
+    $DOM start "$VM" >/dev/null 2>&1 && echo "虚拟机正在启动"
+    # libvirt 偶尔静默失败：确认落到 running，否则重试一次
+    i=0
+    while [ "$i" -lt 5 ]; do
+        [ "$(isto_domstate)" = "running" ] && return 0
+        sleep 2; i=$((i+1))
+    done
+    $DOM start "$VM" >/dev/null 2>&1 && echo "虚拟机起机已重试"
+    return 0
+}
+
+isto_vm_stop() {
+    local st
+    st="$(isto_domstate)"
+    : > "${STOP_MARK}"
+    if [ "$st" = "paused" ]; then
+        $DOM destroy "$VM" >/dev/null 2>&1 && echo "虚拟机已强制断电（原为挂起态）"
+        return 0
+    fi
+    [ "$st" = "running" ] || return 0
+    $DOM shut""down "$VM" >/dev/null 2>&1
+    if isto_watch_alive; then
+        echo "优雅关机指令已在执行中（守望进程 ${STOP_WATCH}）"
+        return 0
+    fi
+    setsid nohup bash "$0" watch-shutdown >/dev/null 2>&1 &
+    echo "优雅关机指令已发出（后台等待，最多 60 秒转强制断电）"
+    return 0
+}
 
 case $1 in
     start)
+        rm -f "${STOP_MARK}"
         systemctl start "$UNIT" 2>/dev/null && echo "IP 寻踪已启动 (入口 36125)"
+        isto_vm_start
         # 重试：后台安装未完成/失败且虚拟机尚未定义时，按原参数重新拉起 worker
         ST="/tmp/istoreos-install.state"
         LOCK="/tmp/istoreos-install.lock"
@@ -35,14 +93,34 @@ case $1 in
         fi
         exit 0
         ;;
+    watch-shutdown)
+        # 后台守望：等优雅关机落定，超时转强制断电；自己记 pid 供 start 判断
+        echo $$ > "${STOP_WATCH}"
+        i=0
+        while [ "$i" -lt 12 ]; do
+            sleep 5
+            [ "$(isto_domstate)" = "shut off" ] && { rm -f "${STOP_WATCH}"; exit 0; }
+            i=$((i+1))
+        done
+        $DOM destroy "$VM" >/dev/null 2>&1
+        rm -f "${STOP_WATCH}"
+        exit 0
+        ;;
     stop)
-        systemctl stop "$UNIT" 2>/dev/null
-        echo "IP 寻踪已停止（不影响虚拟机运行）"
+        isto_vm_stop
+        echo "IP 寻踪入口保持在线（可在入口页一键开机）"
         exit 0
         ;;
     status)
-        # 永远报健康：寻踪器是辅助服务，安装后 unit 创建前有空窗，
-        # 若此处返回非0会被应用中心判定 APP_CRASH 并触发自动清理（2026-09-13 实测教训）
+        # 语义（2026-09-13 两条实测教训的折中）：
+        # · 只有「用户在应用中心主动停用」且虚拟机确实没在跑时才报 3（未运行），
+        #   这样平台状态机才会把「启用」真正回调到 main start——否则它一直以为
+        #   应用在跑，直接回 already started，虚拟机再也起不来。
+        # · 其余场景（安装窗口、从「虚拟机」应用单独关机、状态不确定）一律报 0，
+        #   因为非 0 会被应用中心判成 APP_CRASH 并触发自动清理。
+        if [ -f "${STOP_MARK}" ] && [ "$(isto_domstate)" != "running" ]; then
+            exit 3
+        fi
         exit 0
         ;;
     *) exit 1 ;;

@@ -108,11 +108,21 @@ done
 IMG_GZ="${SHARE_PATH}/istoreos.img.gz"
 IMG_RAW="${SHARE_PATH}/istoreos.img"
 QCOW2_FILE="${SHARE_PATH}/istoreos.qcow2"
+# 存储池位置必须在这里就参与判断：装完机后磁盘会被移进池里，
+# 若只认 SHARE_PATH，重装就会走「重新下载 + vol-delete 覆盖」把用户的盘刷掉。
+POOL_NAME="vol1"
+POOL_PATH="/vol1/vm/pool"
+POOL_QCOW2="${POOL_PATH}/istoreos.qcow2"
 
 # ---- 步骤1: 下载官方镜像（重试3次）----
 if [ -s "${QCOW2_FILE}" ]; then
     CUR="复用已有磁盘"; set_state "reuse-disk"
 echo ">>> 步骤1: 跳过下载（已存在预置后的 ${QCOW2_FILE}）"
+    SKIP_PROV=1
+elif [ -s "${POOL_QCOW2}" ]; then
+    CUR="复用存储池磁盘"; set_state "reuse-disk"
+echo ">>> 步骤1: 跳过下载（存储池已有预置后的 ${POOL_QCOW2}，重装保持原盘）"
+    QCOW2_FILE="${POOL_QCOW2}"
     SKIP_PROV=1
 else
     CUR="下载镜像 v${ISTO_VERSION}"; set_state "downloading ${ISTO_VERSION}"
@@ -193,8 +203,7 @@ fi
 [ "${ISTO_KEEP_IMG:-0}" = "1" ] || rm -f "${IMG_GZ}" "${IMG_RAW}"
 
 # ===== 注册磁盘到 vol1 存储池 (修复显示 0 MB) =====
-POOL_NAME="vol1"
-POOL_PATH="/vol1/vm/pool"
+# POOL_NAME / POOL_PATH / POOL_QCOW2 已在步骤1 之前定义
 if virsh pool-info "${POOL_NAME}" &>/dev/null && [ "${SKIP_PROV}" != "1" ]; then
     echo ">>> 注册磁盘到 ${POOL_NAME} 存储池"
     virsh vol-delete --pool "${POOL_NAME}" istoreos.qcow2 2>/dev/null || true

@@ -275,8 +275,24 @@ DISK_GB=$(qemu-img info "${QCOW2_FILE}" --output json | \
 echo "磁盘实际大小: ${DISK_GB} GB"
 
 # ---- UUID + MAC ----
-VM_UUID=$(uuidgen)
-MAC_ADDR="52:54:$(printf '%02x:%02x:%02x:%02x' $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)))"
+# 重装/升级必须沿用上一次虚拟机定义里的 UUID 与 MAC：iStoreOS 按 MAC 认网口，
+# 路由器也常按 MAC 绑定地址或留租约，每次重装换个随机 MAC，原来的绑定与租约
+# 就全废了，看起来就像「IP 寻踪突然失效」。卸载会把 domain 一起 undefine，
+# 所以 MAC 另外记在 /vol1/vm 下的文件里（与磁盘版本标记同目录，卸载不动它）。
+VM_MAC_FILE="/vol1/vm/istoreos.vm-mac"
+OLD_XML="$(virsh -c qemu:///system dumpxml "${VM_NAME}" 2>/dev/null || true)"
+VM_UUID="$(printf '%s' "${OLD_XML}" | sed -n 's:.*<uuid>\([^<]*\)</uuid>.*:\1:p' | head -1)"
+MAC_ADDR="$(printf '%s' "${OLD_XML}" | sed -n "s:.*<mac address='\([^']*\)'.*:\1:p" | head -1)"
+[ -z "${MAC_ADDR}" ] && [ -s "${VM_MAC_FILE}" ] && MAC_ADDR="$(head -n1 "${VM_MAC_FILE}" | tr -d ' \t\r')"
+if [ -n "${MAC_ADDR}" ]; then
+    echo ">>> 沿用虚拟机标识 mac=${MAC_ADDR}${VM_UUID:+ uuid=${VM_UUID}}（重装不换网卡身份）"
+fi
+[ -n "${VM_UUID}" ] || VM_UUID="$(uuidgen)"
+if ! printf '%s' "${MAC_ADDR}" | grep -qE '^52:54:[0-9a-f]{2}(:[0-9a-f]{2}){3}$'; then
+    MAC_ADDR="52:54:$(printf '%02x:%02x:%02x:%02x' $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)))"
+    echo ">>> 首次装机，随机生成 mac=${MAC_ADDR}"
+fi
+echo "${MAC_ADDR}" > "${VM_MAC_FILE}"
 
 # ---- XML（含完整 metadata，虚拟机应用可正常显示）----
 CUR="创建虚拟机"; set_state "defining-vm"

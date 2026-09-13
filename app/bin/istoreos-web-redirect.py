@@ -18,6 +18,15 @@
   4. 对本机 LAN 子网做并行 ping 扫描逼出 ARP，再按 MAC 反查
   5. HTTP 指纹补齐：ARP 表活跃主机的 :80 抓取首页，含
      iStoreOS/iStore/Luci 特征即认定为目标（排除 NAS 自身与其他设备）
+
+发现链全空（现实中真实存在：链路通、IPv6 SLAAC 都正常，但 LAN 上没有
+任何 DHCPv4 服务器应答，虚拟机就是拿不到 IPv4）时，入口页不再只是干等，
+提供三件事，全部经 libvirt 串口在虚拟机里执行，不依赖网络：
+  · POST /net/dhcp      → ifup lan + 请 netifd 自己的租约客户端续租（绝不在
+                          netifd 托管的口上手跑 udhcpc，见 guest_dhcp_retry 注释）
+  · POST /net/restart   → 重启虚拟机网络（治地址在、路由没了的状态错乱）
+  · POST /net/static    → 给 LAN 口设静态 IPv4（含恢复自动获取）
+  · POST /net/manual    → 只记一个手动跳转地址（虚拟机在别的网段时用）
 """
 import http.client
 import http.server
@@ -25,11 +34,14 @@ import ipaddress
 import json
 import os
 import re
+import shlex
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 import time
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 
 VM_NAME = os.environ.get("ISTO_VM_NAME", "istoreos")
@@ -42,6 +54,10 @@ SWEEP_COOLDOWN = 45
 START_REQ = "/tmp/istoreos-vm-start.req"
 STOP_MARK = "/tmp/istoreos-user-stopped"
 FP_MARKERS = (b"istoreos", b"istore", b"luci")
+# 入口页手动记下的跳转地址（放在应用共享目录，重装不丢）：
+# 寻踪五层全空时的兜底，比如虚拟机被挪到别的网段。
+MANUAL_IP_FILE = "/vol1/@appshare/istoreos/manual-ip"
+GUEST_LAN_DEV = "br-lan"
 
 _lock = threading.Lock()
 _cache = {"ip": None, "mac": None, "ts": 0.0, "sweep_ts": 0.0, "source": None}
@@ -252,6 +268,143 @@ def httpfp_fallback():
     return hits[0] if hits else None
 
 
+# ---- 寻踪之外的兜底：手动跳转地址 + 经串口在虚拟机里修网络 ----
+
+def valid_v4(s):
+    try:
+        ipaddress.IPv4Address(s)
+        return True
+    except ValueError:
+        return False
+
+
+def manual_ip():
+    """入口页手动记下的跳转地址；无效或未设置返回 None。"""
+    try:
+        with open(MANUAL_IP_FILE) as f:
+            v = f.readline().strip()
+    except OSError:
+        return None
+    return v if valid_v4(v) else None
+
+
+def save_manual_ip(v):
+    """空串表示清除，返回生效后的值（None 或地址）。"""
+    try:
+        os.makedirs(os.path.dirname(MANUAL_IP_FILE), exist_ok=True)
+        if v:
+            with open(MANUAL_IP_FILE, "w") as f:
+                f.write(v + "\n")
+        elif os.path.exists(MANUAL_IP_FILE):
+            os.remove(MANUAL_IP_FILE)
+    except OSError:
+        return None
+    return v or None
+
+
+def guest_run(cmds, per=4, tail=900):
+    """通过 libvirt 串口在虚拟机里执行命令——没有 IP 时这是唯一入口。
+
+    用 script(1) 造一个 pty 挂住 virsh console，逐条喂命令，把屏幕内容读回来。
+    命令只在本文件里写死；外部传入的东西必须先过 valid_v4 才拼得进来。
+    """
+    lines = ["sleep 2", "printf '\\n'", "sleep 1"]
+    for c in cmds:
+        lines.append("printf '%s\\n' " + shlex.quote(c))
+        lines.append("sleep %d" % per)
+    lines.append("sleep 3")
+    total = 3 + per * len(cmds) + 20
+    pipeline = ("{ " + "; ".join(lines) + "; } | timeout " + str(total) +
+                " script -qec 'virsh -c qemu:///system console " + VM_NAME + "' /dev/null")
+    try:
+        p = subprocess.run(["bash", "-c", pipeline], capture_output=True,
+                           text=True, timeout=total + 25)
+    except Exception as exc:
+        return "串口执行失败：" + str(exc)
+    return ((p.stdout or "") + (p.stderr or ""))[-tail:]
+
+
+def guest_dhcp_retry():
+    """让 LAN 口重新走一遍 DHCP。
+
+    千万别在这里手跑 `udhcpc -n -t 6 -i br-lan`：那是 netifd 托管的接口，
+    第二个客户端退出时会给脚本发 deconfig，把地址和路由一起冲掉——实测
+    静态地址口被这么搞一次就 `ping: Network unreachable`，虚拟机整个失联
+    （只能 /etc/init.d/network restart 救回来）。所以只让 netifd 自己重来，
+    再顺带请它已有的租约客户端续一次约（静态口没这个对象，报错也无妨）。
+    """
+    return guest_run(["ifup lan",
+                      "ubus call network.interface.lan udhcpc renew 2>/dev/null || true",
+                      "ip -4 a show " + GUEST_LAN_DEV,
+                      "ip route"], per=7)
+
+
+def guest_net_restart():
+    """整机网络重启：治 netifd 状态错乱（地址在、路由没了这类）。"""
+    return guest_run(["/etc/init.d/network restart",
+                      "sleep 8",
+                      "ip -4 a show " + GUEST_LAN_DEV,
+                      "ip route"], per=9)
+
+
+def guest_net_mode(mode, ip="", prefix="24", gw="", dns=""):
+    """在虚拟机里把 LAN 口设为静态地址或恢复自动获取；参数非法返回 None。"""
+    if mode == "static":
+        try:
+            mask = str(ipaddress.IPv4Network(ip + "/" + prefix, strict=False).netmask)
+        except ValueError:
+            return None
+        cmds = ["uci set network.lan.proto='static'",
+                "uci set network.lan.ipaddr='" + ip + "'",
+                "uci set network.lan.netmask='" + mask + "'"]
+        if gw:
+            cmds.append("uci set network.lan.gateway='" + gw + "'")
+        if dns:
+            cmds.append("uci set network.lan.dns='" + dns + "'")
+    else:
+        cmds = ["uci set network.lan.proto='dhcp'",
+                "uci -q del network.lan.ipaddr",
+                "uci -q del network.lan.netmask",
+                "uci -q del network.lan.gateway",
+                "uci -q del network.lan.dns"]
+    cmds += ["uci commit network", "ifup lan", "ip -4 a show " + GUEST_LAN_DEV]
+    return guest_run(cmds, per=4)
+
+
+# 串口操作要几十秒，HTTP 请求不能干等：放后台线程跑，入口页 3 秒一轮看进度
+_net_lock = threading.Lock()
+_net_job = {"running": False, "note": "", "out": "", "ts": 0.0}
+
+
+def start_net_job(kind, args=(), note=""):
+    with _net_lock:
+        if _net_job["running"]:
+            return False
+        if not vm_running():
+            _net_job.update(running=False, note="虚拟机没在运行，串口进不去", out="",
+                            ts=time.time())
+            return False
+        _net_job.update(running=True, note=note, out="", ts=time.time())
+
+    def worker():
+        try:
+            if kind == "dhcp":
+                out = guest_dhcp_retry()
+            elif kind == "dhcp-mode":
+                out = guest_net_mode("dhcp")
+            elif kind == "net-restart":
+                out = guest_net_restart()
+            else:
+                out = guest_net_mode("static", *args)
+        except Exception as exc:
+            out = "执行异常：" + str(exc)
+        with _net_lock:
+            _net_job.update(running=False, note=note, out=(out or "")[-1200:])
+
+    threading.Thread(target=worker, daemon=True).start()
+    return True
+
+
 def resolve_ip():
     """找虚拟机地址。返回 dict，不只是"有没有 IP"：
       ip      探活通过、可以直接跳过去的地址（没有就 None）
@@ -264,6 +417,11 @@ def resolve_ip():
     """
     now = time.time()
     with _lock:
+        # 手动指定过地址就优先用它（仍要探活），五层发现链救不了的场景兜底
+        man = manual_ip()
+        if man and tcp_open(man, TARGET_PORT):
+            return {"ip": man, "source": "manual", "stage": "ok",
+                    "probing": None, "mac": vm_mac()}
         if not vm_running():
             _cache["ip"] = None
             return {"ip": None, "source": None, "stage": "stopped",
@@ -329,6 +487,13 @@ p{color:#8296a8;font-size:14px;margin:0 0 24px;line-height:1.7}\
 code{font-size:12px;color:#5f7385;background:#131c26;padding:2px 8px;border-radius:6px}\
 button{font-size:15px;padding:11px 34px;border-radius:999px;border:0;background:#2563eb;\
 color:#fff;cursor:pointer;letter-spacing:1px}button:hover{background:#3b76f0}\
+button.alt{background:#1d2b38;color:#a9bccd}a{color:#4f8df9;text-decoration:none}\
+.sec{text-align:left;font-size:13px;color:#5f7385;margin:20px 0 10px;\
+border-top:1px solid #16222e;padding-top:14px}\
+form{margin:0 0 12px}input,select{font-size:14px;padding:10px 12px;border-radius:10px;\
+border:1px solid #223140;background:#101a23;color:#e6edf3;margin:0 6px 10px 0}\
+pre{font-size:12px;color:#8296a8;background:#101a23;padding:10px 12px;border-radius:10px;\
+text-align:left;overflow:auto;white-space:pre-wrap}\
 </style></head><body><div class="c">$BODY</div></body></html>"""
 
 
@@ -378,6 +543,60 @@ class Handler(http.server.BaseHTTPRequestHandler):
         html = html.replace("$PORT", str(PORT)).replace("$TARGET", str(TARGET_PORT))
         return html.encode("utf-8")
 
+    def _raw(self, body, refresh=0):
+        rf = f'<meta http-equiv="refresh" content="{refresh}">' if refresh else ""
+        html = PAGE_TMPL.replace("$REFRESH", rf).replace("$BODY", body)
+        return html.encode("utf-8")
+
+    def _net_page(self, note=""):
+        """网络修复页：不自动刷新（表单页刷新会把填一半的东西冲掉），
+        只有串口任务在跑时才 3 秒轮询一次。"""
+        st = resolve_ip()
+        man = manual_ip() or ""
+        with _net_lock:
+            job = dict(_net_job)
+        esc = lambda s: (s or "").replace("&", "&amp;").replace("<", "&lt;")
+        parts = ['<span class="dot"></span><h1>网络修复</h1>',
+                 '<p>下面几步都是经 libvirt 串口直接在虚拟机里执行，'
+                 '虚拟机没有 IP 也能用。</p>']
+        if note:
+            parts.append(f'<p><code>{esc(note)}</code></p>')
+        if job["running"]:
+            parts.append(f'<p>串口正在执行：{esc(job["note"])}'
+                         f'<br>约需一分钟，页面会自动刷新。</p>')
+        parts.append('<form method="post" action="/net/dhcp">'
+                     '<button type="submit">重新获取 IP（重试 DHCP）</button></form>')
+        parts.append('<div class="sec">地址在、路由却没了之类的状态错乱</div>')
+        parts.append('<form method="post" action="/net/restart">'
+                     '<button class="alt" type="submit">重启虚拟机网络</button></form>')
+        parts.append('<div class="sec">路由器不发地址时：给虚拟机指定静态地址</div>')
+        parts.append('<form method="post" action="/net/static">'
+                     '<input name="ip" placeholder="IP 192.168.3.72" inputmode="decimal">'
+                     '<select name="prefix"><option value="24">/24</option>'
+                     '<option value="16">/16</option><option value="8">/8</option></select>'
+                     '<input name="gw" placeholder="网关 192.168.3.1">'
+                     '<input name="dns" placeholder="DNS（可留空）">'
+                     '<button type="submit">应用</button></form>')
+        parts.append('<form method="post" action="/net/dhcp-mode">'
+                     '<button class="alt" type="submit">恢复自动获取</button></form>')
+        parts.append('<div class="sec">虚拟机在别的网段时：手动指定跳转地址</div>')
+        parts.append('<form method="post" action="/net/manual">'
+                     f'<input name="ip" placeholder="{man or "已知地址 192.168.1.1"}"'
+                     ' inputmode="decimal">'
+                     '<button type="submit">保存</button></form>')
+        if man:
+            parts.append('<form method="post" action="/net/manual">'
+                         '<button class="alt" type="submit" name="clear" value="1">'
+                         '清除手动地址</button></form>')
+        parts.append('<div class="sec">当前</div>')
+        parts.append('<p>阶段 <code>{}</code><br>网卡 <code>{}</code><br>系统 <code>{}</code>'
+                     '{}<br><a href="/">← 返回入口</a></p>'.format(
+                         st["stage"], st["mac"] or "未知", os_version() or "未知",
+                         f'<br>手动地址 <code>{man}</code>' if man else ""))
+        if not job["running"] and job["out"]:
+            parts.append(f'<pre>{esc(job["out"])}</pre>')
+        return self._raw("".join(parts), refresh=3 if job["running"] else 0)
+
     def do_GET(self):
         path = self.path
         pure = path.split("?")[0]
@@ -387,13 +606,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if pure == "/api/status":
             r = resolve_ip()
             payload = json.dumps(
-                {"running": bool(r["ip"]) or vm_running(), "ip": r["ip"],
+                # running 用同一份快照判断：早先是再调一次 vm_running()，
+                # 与 stage 的来源不是同一次 virsh，出现过 stage=no-ip 而
+                # running=false 的自相矛盾输出。
+                {"running": r["stage"] != "stopped", "ip": r["ip"],
                  "source": r["source"], "stage": r["stage"], "probing": r["probing"],
-                 "mac": r["mac"], "os_version": os_version(),
+                 "mac": r["mac"], "os_version": os_version(), "manual": manual_ip(),
                  "target_port": TARGET_PORT, "install_state": install_state()},
                 ensure_ascii=False,
             ).encode("utf-8")
             self._send(200, payload, "application/json; charset=utf-8")
+            return
+        if pure == "/net":
+            self._send(200, self._net_page())
             return
         if pure == "/power/start":
             # 开机接口只认 POST。浏览器停在 /power/start 时刷新、后退或
@@ -425,8 +650,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "准备中", "正在等待应用完成安装。", refresh=5, dot="wait"))
             return
         if r["stage"] == "stopped":
-            # 虚拟机关着：打开入口就顺手补开机。应用中心的「启用」不会回调应用
-            # 脚本（实测 cmd/main 只收到 stop），停用后想再用只能靠这一脚。
+            if os.path.exists(STOP_MARK):
+                # 用户在应用中心点过「停用」：那就别擅自开机，给回 1.1.2 那套
+                # 简洁关机页 + 一键开机按钮（点了才开，开了自动跳）。
+                btn = ('<form method="POST" action="/power/start">'
+                       '<button type="submit">启动虚拟机</button></form>')
+                self._send(200, self._page("iStoreOS 已关机", btn, refresh=5))
+                return
+            # 不是用户关的（应用重启、虚拟机里手动关机等）：打开入口就顺手补开机。
+            # 应用中心的「启用」不会回调应用脚本（实测 cmd/main 只收到 stop）。
             vm_power_on()
             self._send(200, self._page(
                 "正在启动", "iStoreOS 就绪后会自动打开。", refresh=5, dot="wait"))
@@ -437,22 +669,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 f"已找到 <code>{r['probing']}</code>，iStoreOS 的 Web 服务还在起来。",
                 refresh=5, dot="wait"))
             return
-        # 虚拟机开着却始终没有可用地址：多半是路由器 DHCP 没发地址，
-        # 这句得说清楚，否则只能连串口看。
+        # 虚拟机开着却始终没有可用地址：现实里真发生过——链路通、IPv6 都拿到了，
+        # 但 LAN 上没有 DHCPv4 服务器应答。这时不能只让用户干等，给出串口修复入口。
         self._send(200, self._page(
             "正在获取地址",
-            f"虚拟机已开机，iStoreOS 还在获取 IP（网卡 <code>{r['mac'] or '未知'}</code>）。"
-            f"<br>几分钟后仍无地址，请检查路由器 DHCP。",
+            f"虚拟机已开机，iStoreOS 还没拿到 IPv4（网卡 <code>{r['mac'] or '未知'}</code>）。"
+            f"<br>通常是路由器 DHCP 没发地址；等不下去可以"
+            f"<a href=\"/net\">手动处理</a>（重试 DHCP / 设静态地址）。",
             refresh=5, dot="wait"))
 
     def do_POST(self):
         pure = self.path.split("?")[0]
+        raw = b""
         try:
             length = int(self.headers.get("Content-Length") or 0)
             if length:
-                self.rfile.read(length)
+                raw = self.rfile.read(length)
         except ValueError:
             pass
+        form = urllib.parse.parse_qs(raw.decode("utf-8", "replace"))
+        field = lambda k: (form.get(k) or [""])[0].strip()
+
         if pure == "/power/start":
             res = vm_power_on()
             msg = {"starting": "iStoreOS 就绪后会自动打开。",
@@ -463,12 +700,57 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # （/power/start）重新 GET，等于把控制路径跳给虚拟机。
             self._send(200, self._page("正在启动", msg, refresh="5;url=/", dot="wait"))
             return
+
+        if pure == "/net/dhcp":
+            ok = start_net_job("dhcp", note="ifup lan + 请 netifd 续租")
+            self._send(200, self._net_page("" if ok else "上一个串口任务还没结束，稍等一下"))
+            return
+        if pure == "/net/dhcp-mode":
+            ok = start_net_job("dhcp-mode", note="把 LAN 口改回自动获取")
+            self._send(200, self._net_page("" if ok else "上一个串口任务还没结束，稍等一下"))
+            return
+        if pure == "/net/restart":
+            ok = start_net_job("net-restart", note="重启虚拟机网络")
+            self._send(200, self._net_page("" if ok else "上一个串口任务还没结束，稍等一下"))
+            return
+        if pure == "/net/static":
+            ip, gw, dns, prefix = field("ip"), field("gw"), field("dns"), field("prefix") or "24"
+            bad = [v for v in (ip, gw, dns) if v and not valid_v4(v)]
+            if not valid_v4(ip) or bad or prefix not in ("8", "16", "24"):
+                self._send(200, self._net_page("地址不合法：请填写正确的 IPv4（网关/DNS 可留空）"))
+                return
+            ok = start_net_job("static", args=(ip, prefix, gw, dns),
+                               note=f"设静态地址 {ip}/{prefix}")
+            self._send(200, self._net_page("" if ok else "上一个串口任务还没结束，稍等一下"))
+            return
+        if pure == "/net/manual":
+            if field("clear") == "1":
+                save_manual_ip("")
+                self._send(200, self._net_page("已清除手动跳转地址。"))
+                return
+            v = field("ip")
+            if v and not valid_v4(v):
+                self._send(200, self._net_page("地址不合法：请填写正确的 IPv4"))
+                return
+            save_manual_ip(v)
+            self._send(200, self._net_page(
+                f"手动跳转地址已{'保存，探活通过就会直接跳过去' if v else '清除'}"
+                f'{": " + v if v else ""}。'))
+            return
         self._send(404, b"not found", "text/plain")
 
     do_HEAD = do_GET
 
     def log_message(self, fmt, *args):
         pass
+
+    def handle_error(self, request, client_address):
+        """入口页每 5 秒轮询，浏览器经常提前掐线；这种 ConnectionResetError
+        不是故障，别把它刷进 journal。"""
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionResetError, BrokenPipeError)):
+            return
+        super().handle_error(request, client_address)
 
 
 def main():

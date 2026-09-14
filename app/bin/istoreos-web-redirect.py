@@ -50,6 +50,8 @@ TARGET_PORT = int(os.environ.get("ISTO_TARGET_PORT", "80"))
 MDNS_NAMES = os.environ.get("ISTO_MDNS_NAMES", "istoreos.local openwrt.local").split()
 CACHE_TTL = 20
 SWEEP_COOLDOWN = 45
+# 刚点过开机的这段时间里，地址不应答多半是系统还在起，不判成死地址
+BOOT_GRACE = 90
 # 与 cmd/main 共用的两个状态文件：开机请求登记 / 用户主动停用标记
 START_REQ = "/tmp/istoreos-vm-start.req"
 STOP_MARK = "/tmp/istoreos-user-stopped"
@@ -77,6 +79,38 @@ def tcp_open(ip, port, timeout=0.5):
         s = socket.create_connection((ip, port), timeout=timeout)
         s.close()
         return True
+    except OSError:
+        return False
+
+
+def host_alive(ip, timeout=1):
+    """ICMP 探一句：这个地址上到底还有没有机器在应答。
+
+    TCP 端口没通有两种完全不同的情况：系统已经起来、Web 服务还在起（该说
+    「Web 服务还在起来」），和 ARP/DHCP 租约里残留的地址压根没人在用（该说
+    「还在获取 IP」）。只看端口分不出来，ping 一下就分开了。
+    参数不过 valid_v4 不进命令，且用列表传参、不走 shell。
+    """
+    if not ip or not valid_v4(ip):
+        return False
+    try:
+        return subprocess.run(
+            ["ping", "-c", "1", "-W", str(int(timeout)), ip],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=timeout + 2).returncode == 0
+    except Exception:
+        return False
+
+
+def just_powered_on(window=BOOT_GRACE):
+    """刚点过「启动虚拟机」或自动补开机不久的宽限期。
+
+    这段时间里地址不应答是正常的（系统还在起），不能马上判成死地址，
+    否则每次重启都会先闪一句「还没拿到 IP」。判据是开机请求文件的新鲜度——
+    入口按钮、自动补开机、cmd/main 开机都会写它。
+    """
+    try:
+        return time.time() - os.path.getmtime(START_REQ) < window
     except OSError:
         return False
 
@@ -123,6 +157,19 @@ def vm_mac():
     return m.group(0) if m else None
 
 
+def arp_line_state_ok(flags_field):
+    """ARP 表第 3 列 Flags：0x2 才是「已完成」的表项。
+
+    没解析成功的残留项（Flags 0x0）也留在表里，MAC 还写着虚拟机的——
+    虚拟机换了地址或根本没开机时，照单全收就会拿着一个死地址告诉用户
+    「已找到 192.168.3.x」，一等就是几十分钟。
+    """
+    try:
+        return bool(int(flags_field, 16) & 0x2)
+    except (ValueError, TypeError):
+        return False
+
+
 def arp_lookup(mac):
     if not mac:
         return None
@@ -130,7 +177,8 @@ def arp_lookup(mac):
         with open("/proc/net/arp") as f:
             for line in f:
                 parts = line.split()
-                if len(parts) >= 4 and parts[3].lower() == mac.lower():
+                if (len(parts) >= 4 and parts[3].lower() == mac.lower()
+                        and arp_line_state_ok(parts[2])):
                     return parts[0]
     except OSError:
         pass
@@ -174,7 +222,8 @@ def arp_mac_of(ip):
         with open("/proc/net/arp") as f:
             for line in f:
                 parts = line.split()
-                if len(parts) >= 4 and parts[0] == ip:
+                if (len(parts) >= 4 and parts[0] == ip
+                        and arp_line_state_ok(parts[2])):
                     return parts[3].lower()
     except OSError:
         pass
@@ -411,6 +460,7 @@ def resolve_ip():
       source  发现层（mac+arp / mdns / domifaddr / sweep+arp / httpfp）
       stage   ok / web-warming（找到地址但 80 还没通）/ no-ip（开好了没地址）/ stopped
       probing 探活没通过的那个候选地址，纯给排障看
+      stale   该候选已经不应答了（ARP/租约残留），此时 stage 是 no-ip 不是 web-warming
       mac     虚拟机网卡 MAC，排障用
     以前只回 (ip, source)，于是「没开机」「开好了但没 IP」「有 IP 但 Web 没起」
     三种完全不同的情况在入口页都是同一句"正在启动"，出问题只能靠串口。
@@ -421,17 +471,17 @@ def resolve_ip():
         man = manual_ip()
         if man and tcp_open(man, TARGET_PORT):
             return {"ip": man, "source": "manual", "stage": "ok",
-                    "probing": None, "mac": vm_mac()}
+                    "probing": None, "stale": False, "mac": vm_mac()}
         if not vm_running():
             _cache["ip"] = None
             return {"ip": None, "source": None, "stage": "stopped",
-                    "probing": None, "mac": vm_mac()}
+                    "probing": None, "stale": False, "mac": vm_mac()}
         # 缓存命中：TCP 快速验证后直接采用
         if (_cache["ip"] and now - _cache["ts"] < CACHE_TTL
                 and mac_ok_for(_cache["ip"])
                 and tcp_open(_cache["ip"], TARGET_PORT)):
             return {"ip": _cache["ip"], "source": _cache["source"], "stage": "ok",
-                    "probing": None, "mac": _cache["mac"]}
+                    "probing": None, "stale": False, "mac": _cache["mac"]}
         mac = vm_mac()
         # 1) MAC → ARP
         ip = arp_lookup(mac)
@@ -455,21 +505,26 @@ def resolve_ip():
         if not ip:
             ip = httpfp_fallback()
             source = "httpfp" if ip else None
-        probing = None
+        probing, stale = None, False
         if ip and not tcp_open(ip, TARGET_PORT):
-            # ARP 表/DHCP 租约里的地址可能是上一次开机留下的，
-            # 虚拟机还在起 Web 服务时跳过去就是 ERR_ADDRESS_UNREACHABLE，
-            # 因此端口没通就当没找到，让入口页继续 5 秒轮询。
+            # 端口没通不等于「Web 还在起」，要先看那地址上到底有没有机器：
+            #   有人应答 → 系统起来了、Web 服务还没就绪 → web-warming（等就是了）
+            #   没人应答 → ARP/租约里的残留地址 → no-ip（得让用户去手动处理）
+            # 以前一律报 web-warming，于是路由器不发地址时入口能挂着
+            # 「已找到 192.168.3.72，Web 服务还在起来」挂一整天，把排障带偏。
             # 注意：地址作废时 source 也得一起作废，否则 /api/status 会出现
             # {"ip": null, "source": "mac+arp"} 这种自相矛盾的排障线索。
             probing, ip, source = ip, None, None
+            if not host_alive(probing) and not just_powered_on():
+                stale = True
         if ip:
             _cache.update(ip=ip, mac=mac, ts=now, source=source)
             return {"ip": ip, "source": source, "stage": "ok",
-                    "probing": None, "mac": mac}
+                    "probing": None, "stale": False, "mac": mac}
         _cache["ip"] = None
-        return {"ip": None, "source": None, "stage": "web-warming" if probing else "no-ip",
-                "probing": probing, "mac": mac}
+        return {"ip": None, "source": None,
+                "stage": "no-ip" if (stale or not probing) else "web-warming",
+                "probing": probing, "stale": stale, "mac": mac}
 
 
 PAGE_TMPL = """<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">\
@@ -632,6 +687,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 {"running": r["stage"] != "stopped", "ip": r["ip"],
                  "source": r["source"], "stage": r["stage"], "probing": r["probing"],
                  "mac": r["mac"], "os_version": os_version(), "manual": manual_ip(),
+                 "stale": bool(r.get("stale")),
                  "target_port": TARGET_PORT, "install_state": install_state()},
                 ensure_ascii=False,
             ).encode("utf-8")
@@ -691,10 +747,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         # 虚拟机开着却始终没有可用地址：现实里真发生过——链路通、IPv6 都拿到了，
         # 但 LAN 上没有 DHCPv4 服务器应答。这时不能只让用户干等，给出串口修复入口。
+        residue = (f"<br>ARP 里还留着 <code>{r['probing']}</code>，"
+                   f"但它现在不应答，是上次开机留下的。"
+                   if r.get("stale") and r.get("probing") else "")
         self._send(200, self._page(
             "正在获取地址",
             f"虚拟机已开机，iStoreOS 还没拿到 IPv4（网卡 <code>{r['mac'] or '未知'}</code>）。"
-            f"<br>通常是路由器 DHCP 没发地址；等不下去可以"
+            f"{residue}<br>通常是路由器 DHCP 没发地址；等不下去可以"
             f"<a href=\"/net\">手动处理</a>（重试 DHCP / 设静态地址）。",
             refresh=5, dot="wait"))
 

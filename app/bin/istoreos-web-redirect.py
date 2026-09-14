@@ -61,7 +61,11 @@ FP_MARKERS = (b"istoreos", b"istore", b"luci")
 MANUAL_IP_FILE = "/vol1/@appshare/istoreos/manual-ip"
 GUEST_LAN_DEV = "br-lan"
 
-_lock = threading.Lock()
+# 必须是**可重入**锁：_resolve_locked() 内部自己也要拿它，而调用方
+# （discovery_loop 与 resolve_ip 的冷启动路径）是先持锁再调它。用普通 Lock 时
+# 第一次发现就自我死锁——36125 端口只听不答，整个入口页从此卡死
+# （1.1.7 引入、1.1.8 修复；离线用例「发现锁必须可重入」守着）。
+_lock = threading.RLock()
 _cache = {"ip": None, "mac": None, "ts": 0.0, "sweep_ts": 0.0, "source": None}
 
 

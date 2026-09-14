@@ -55,6 +55,13 @@ BOOT_GRACE = 90
 # 与 cmd/main 共用的两个状态文件：开机请求登记 / 用户主动停用标记
 START_REQ = "/tmp/istoreos-vm-start.req"
 STOP_MARK = "/tmp/istoreos-user-stopped"
+# 应用中心里本应用的身份：入口页叫醒虚拟机后要拿它把平台状态一起带起来，
+# 否则平台一直挂着「已停用」，界面上的停用会变成空操作（见 platform_sync_start）
+APP_ID = os.environ.get("ISTO_APP_ID", "com.istoreos.vm")
+APPCENTER_CLI = "/usr/local/bin/appcenter-cli"
+PLAT_SYNC_COOLDOWN = 60     # 秒：冷却期内不重复敲平台
+_plat_lock = threading.Lock()
+_plat_sync = {"ts": 0.0}
 FP_MARKERS = (b"istoreos", b"istore", b"luci")
 # 入口页手动记下的跳转地址（放在应用共享目录，重装不丢）：
 # 寻踪五层全空时的兜底，比如虚拟机被挪到别的网段。
@@ -123,6 +130,34 @@ def vm_running():
     return "running" in _sh(f"virsh -c qemu:///system domstate {VM_NAME}", 8)
 
 
+def platform_sync_start():
+    """把应用中心的状态同步成「已启动」。
+
+    入口页的一键开机/自动补开是直接 virsh start，平台完全不知情：应用中心还挂着
+    「已停用」。而它一旦以为自己已经停用，界面上的「停用」就不会再回调 cmd/main
+    ——实测 2026-09-14：虚拟机明明在跑，`appcenter-cli stop` 却成了空操作，必须
+    先「启用」再「停用」才关得掉，用户只会被莫名卡住。这里补一次
+    `appcenter-cli start` 把记账扳回来（实测约 2 秒，且不会重启本服务，pid 不变）。
+    """
+    now = time.time()
+    with _plat_lock:
+        if now - _plat_sync["ts"] < PLAT_SYNC_COOLDOWN:
+            return
+        _plat_sync["ts"] = now
+    if os.path.exists(STOP_MARK):
+        return          # 用户刚刚点过停用，别跟他抢方向盘
+    cli = shutil.which("appcenter-cli") or APPCENTER_CLI
+    try:
+        subprocess.run([cli, "start", APP_ID], capture_output=True, timeout=10)
+    except Exception:
+        pass            # 同步失败不影响入口本身，下次开机再试
+
+
+def platform_sync_start_async():
+    """平台记账的活不该拖住 HTTP 响应，丢后台干。"""
+    threading.Thread(target=platform_sync_start, daemon=True).start()
+
+
 def vm_defined():
     return bool(_sh(f"virsh -c qemu:///system dominfo {VM_NAME}", 8).strip())
 
@@ -142,13 +177,18 @@ def vm_power_on():
         pass
     st = _sh(f"virsh -c qemu:///system domstate {VM_NAME}", 8)
     if "running" in st:
+        # 虚拟机本来就在跑也要扳一次记账：可能是上一版留下的背离，也可能是别人
+        # 在「虚拟机」应用里开的——平台不知道，停用就会变成空操作。
+        platform_sync_start_async()
         return "already-running"
     if not vm_defined():
         return "undefined"
     if "paused" in st:
         _sh(f"virsh -c qemu:///system resume {VM_NAME}", 15)
+        platform_sync_start_async()
         return "resumed"
     _sh(f"virsh -c qemu:///system start {VM_NAME}", 20)
+    platform_sync_start_async()
     return "starting"
 
 

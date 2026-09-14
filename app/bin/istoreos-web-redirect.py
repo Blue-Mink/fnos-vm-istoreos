@@ -454,13 +454,17 @@ def start_net_job(kind, args=(), note=""):
     return True
 
 
-def resolve_ip():
-    """找虚拟机地址。返回 dict，不只是"有没有 IP"：
+def _resolve_locked():
+    """真正干活的发现链，只在持有 _lock 时调用。返回 dict：
       ip      探活通过、可以直接跳过去的地址（没有就 None）
       source  发现层（mac+arp / mdns / domifaddr / sweep+arp / httpfp）
       stage   ok / web-warming（找到地址但 80 还没通）/ no-ip（开好了没地址）/ stopped
       probing 探活没通过的那个候选地址，纯给排障看
       stale   该候选已经不应答了（ARP/租约残留），此时 stage 是 no-ip 不是 web-warming
+
+    这条链在「没有地址」时最费时间（mDNS + domifaddr + 整段局域网 ping 扫描
+    + HTTP 指纹，实测单次 10~16 秒），所以绝不直接在 HTTP 请求里调用它——
+    入口页 5 秒一轮，全排队的话页面能拖到几十秒。统一走下面的 resolve_ip()。
       mac     虚拟机网卡 MAC，排障用
     以前只回 (ip, source)，于是「没开机」「开好了但没 IP」「有 IP 但 Web 没起」
     三种完全不同的情况在入口页都是同一句"正在启动"，出问题只能靠串口。
@@ -525,6 +529,45 @@ def resolve_ip():
         return {"ip": None, "source": None,
                 "stage": "no-ip" if (stale or not probing) else "web-warming",
                 "probing": probing, "stale": stale, "mac": mac}
+
+
+# 发现结果由后台线程维护，HTTP 请求只读缓存：没地址时入口也能瞬间出画面。
+# ask 是「上一次有人真的来看」的时间戳——没人看的时候把节奏放慢，别空转。
+_last = {"res": None, "ts": 0.0, "ask": 0.0}
+DISCOVERY_INTERVAL = 5      # 有人在看：每 5 秒发现一次
+DISCOVERY_IDLE = 20         # 没人看：降到每 20 秒
+
+
+def resolve_ip():
+    """入口页与状态接口统一用它：瞬间返回后台发现线程维护的最新结论。
+
+    冷启动（一次都还没跑过）才现算一次，避免首页空着。返回的结论最多旧一个
+    发现周期（5 秒），跟入口页自己的轮询节奏一致，用户看不出差别。
+    """
+    res = _last["res"]
+    _last["ask"] = time.time()
+    if res is None:
+        with _lock:
+            if _last["res"] is None:
+                _last.update(res=_resolve_locked(), ts=time.time())
+            res = _last["res"]
+    return dict(res) if res else {"ip": None, "source": None, "stage": "no-ip",
+                                  "probing": None, "stale": False, "mac": None}
+
+
+def discovery_loop():
+    """后台单飞：按节奏跑发现链，结果写进 _last 供所有请求读。"""
+    while True:
+        try:
+            with _lock:
+                res = _resolve_locked()
+            _last.update(res=res, ts=time.time())
+        except Exception:
+            pass    # 单轮失败下一轮再来，别把线程搞死
+        # 入口页开着时勤快点，没人看时省点 CPU
+        gap = (DISCOVERY_INTERVAL
+               if time.time() - _last["ask"] < 30 else DISCOVERY_IDLE)
+        time.sleep(gap)
 
 
 PAGE_TMPL = """<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">\
@@ -835,6 +878,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 def main():
     httpd = http.server.ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     httpd.daemon_threads = True
+    threading.Thread(target=discovery_loop, daemon=True).start()
     print(f"[istoreos-web] {PORT} finder -> vm '{VM_NAME}' :{TARGET_PORT}")
     httpd.serve_forever()
 

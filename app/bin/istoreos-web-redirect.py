@@ -488,6 +488,20 @@ code{font-size:12px;color:#5f7385;background:#131c26;padding:2px 8px;border-radi
 button{font-size:15px;padding:11px 34px;border-radius:999px;border:0;background:#2563eb;\
 color:#fff;cursor:pointer;letter-spacing:1px}button:hover{background:#3b76f0}\
 button.alt{background:#1d2b38;color:#a9bccd}a{color:#4f8df9;text-decoration:none}\
+\
+.mini{color:#5f7385;font-size:12px;margin:0 0 14px;line-height:1.75;word-break:break-all}\
+.row{display:flex;gap:10px;justify-content:center;align-items:center;flex-wrap:wrap;margin:0 0 12px}\
+.row form{margin:0}\
+button.sm{font-size:14px;padding:9px 20px;letter-spacing:.5px}\
+details{max-width:340px;margin:0 auto 12px;border:1px solid #16222e;border-radius:14px;\
+padding:0 14px;text-align:left}\
+summary{font-size:13px;color:#8296a8;padding:12px 0;cursor:pointer;list-style:none;outline:none}\
+summary::-webkit-details-marker{display:none}\
+summary::before{content:"▸  ";color:#4f8df9}\
+details[open] summary::before{content:"▾  "}\
+details form{margin:4px 0 14px;display:flex;gap:8px;flex-wrap:wrap}\
+details input,details select,details button{margin:0}\
+details input{flex:1 1 118px;min-width:0}\
 .sec{text-align:left;font-size:13px;color:#5f7385;margin:20px 0 10px;\
 border-top:1px solid #16222e;padding-top:14px}\
 form{margin:0 0 12px}input,select{font-size:14px;padding:10px 12px;border-radius:10px;\
@@ -549,53 +563,59 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return html.encode("utf-8")
 
     def _net_page(self, note=""):
-        """网络修复页：不自动刷新（表单页刷新会把填一半的东西冲掉），
-        只有串口任务在跑时才 3 秒轮询一次。"""
+        """网络修复页：跟入口页同一套简洁风——默认只露「重新获取 IP」，
+        静态地址、手动跳转地址、串口输出都折进可展开的小节，状态压成一行小字。
+        页面不自动刷新（表单页刷新会把填一半的东西冲掉），
+        只有串口任务在跑时才 3 秒轮一次。逻辑一行没动，改的只是版式。"""
         st = resolve_ip()
         man = manual_ip() or ""
         with _net_lock:
             job = dict(_net_job)
         esc = lambda s: (s or "").replace("&", "&amp;").replace("<", "&lt;")
-        parts = ['<span class="dot"></span><h1>网络修复</h1>',
-                 '<p>下面几步都是经 libvirt 串口直接在虚拟机里执行，'
-                 '虚拟机没有 IP 也能用。</p>']
+        busy = job["running"]
+        stage_cn = {"ok": "就绪", "web-warming": "Web 服务启动中",
+                    "no-ip": "还在获取 IP", "stopped": "虚拟机未开机"}.get(
+                        st["stage"], st["stage"])
+        p = ['<div><span class="dot%s"></span></div><h1>网络修复</h1>'
+             % (" wait" if busy else ""),
+             '<p class="mini">下面几步经 libvirt 串口在虚拟机里执行，它没有 IP 也能用。</p>']
         if note:
-            parts.append(f'<p><code>{esc(note)}</code></p>')
-        if job["running"]:
-            parts.append(f'<p>串口正在执行：{esc(job["note"])}'
-                         f'<br>约需一分钟，页面会自动刷新。</p>')
-        parts.append('<form method="post" action="/net/dhcp">'
-                     '<button type="submit">重新获取 IP（重试 DHCP）</button></form>')
-        parts.append('<div class="sec">地址在、路由却没了之类的状态错乱</div>')
-        parts.append('<form method="post" action="/net/restart">'
-                     '<button class="alt" type="submit">重启虚拟机网络</button></form>')
-        parts.append('<div class="sec">路由器不发地址时：给虚拟机指定静态地址</div>')
-        parts.append('<form method="post" action="/net/static">'
-                     '<input name="ip" placeholder="IP 192.168.3.72" inputmode="decimal">'
-                     '<select name="prefix"><option value="24">/24</option>'
-                     '<option value="16">/16</option><option value="8">/8</option></select>'
-                     '<input name="gw" placeholder="网关 192.168.3.1">'
-                     '<input name="dns" placeholder="DNS（可留空）">'
-                     '<button type="submit">应用</button></form>')
-        parts.append('<form method="post" action="/net/dhcp-mode">'
-                     '<button class="alt" type="submit">恢复自动获取</button></form>')
-        parts.append('<div class="sec">虚拟机在别的网段时：手动指定跳转地址</div>')
-        parts.append('<form method="post" action="/net/manual">'
-                     f'<input name="ip" placeholder="{man or "已知地址 192.168.1.1"}"'
-                     ' inputmode="decimal">'
-                     '<button type="submit">保存</button></form>')
-        if man:
-            parts.append('<form method="post" action="/net/manual">'
-                         '<button class="alt" type="submit" name="clear" value="1">'
-                         '清除手动地址</button></form>')
-        parts.append('<div class="sec">当前</div>')
-        parts.append('<p>阶段 <code>{}</code><br>网卡 <code>{}</code><br>系统 <code>{}</code>'
-                     '{}<br><a href="/">← 返回入口</a></p>'.format(
-                         st["stage"], st["mac"] or "未知", os_version() or "未知",
-                         f'<br>手动地址 <code>{man}</code>' if man else ""))
-        if not job["running"] and job["out"]:
-            parts.append(f'<pre>{esc(job["out"])}</pre>')
-        return self._raw("".join(parts), refresh=3 if job["running"] else 0)
+            p.append('<p class="mini"><code>%s</code></p>' % esc(note))
+        if busy:
+            p.append('<p class="mini">串口正在执行：%s，约需一分钟，页面会自动刷新。</p>'
+                     % esc(job["note"]))
+        p.append('<div class="row"><form method="post" action="/net/dhcp">'
+                 '<button type="submit">重新获取 IP</button></form></div>')
+        p.append('<div class="row">'
+                 '<form method="post" action="/net/restart">'
+                 '<button class="alt sm" type="submit">重启网络</button></form>'
+                 '<form method="post" action="/net/dhcp-mode">'
+                 '<button class="alt sm" type="submit">恢复自动获取</button></form></div>')
+        p.append('<details><summary>路由器不发地址时：指定静态 IP</summary>'
+                 '<form method="post" action="/net/static">'
+                 '<input name="ip" placeholder="IP 192.168.3.72" inputmode="decimal">'
+                 '<select name="prefix"><option value="24">/24</option>'
+                 '<option value="16">/16</option><option value="8">/8</option></select>'
+                 '<input name="gw" placeholder="网关（可留空）">'
+                 '<input name="dns" placeholder="DNS（可留空）">'
+                 '<button class="sm" type="submit">应用</button></form></details>')
+        p.append('<details><summary>虚拟机在别的网段：手动指定跳转地址</summary>'
+                 '<form method="post" action="/net/manual">'
+                 '<input name="ip" placeholder="%s" inputmode="decimal">'
+                 '<button class="sm" type="submit">保存</button></form>%s</details>'
+                 % (esc(man) or "已知地址 192.168.1.1",
+                    ('<p class="mini">当前 %s</p>'
+                     '<form method="post" action="/net/manual">'
+                     '<button class="alt sm" type="submit" name="clear" value="1">'
+                     '清除手动地址</button></form>' % esc(man)) if man else ""))
+        if not busy and job["out"]:
+            p.append('<details><summary>串口输出</summary><pre>%s</pre></details>'
+                     % esc(job["out"]))
+        p.append('<p class="mini">%s · %s · %s</p>'
+                 % (esc(stage_cn), esc(st["mac"] or "无网卡"),
+                    esc(os_version() or "未知")))
+        p.append('<p><a href="/">← 返回入口</a></p>')
+        return self._raw("".join(p), refresh=3 if busy else 0)
 
     def do_GET(self):
         path = self.path

@@ -130,6 +130,27 @@ def vm_running():
     return "running" in _sh(f"virsh -c qemu:///system domstate {VM_NAME}", 8)
 
 
+# 开关机态的 1 秒记忆：virsh 一问要 0.1 秒上下，入口页连打时别每次都敲
+_power = {"v": None, "ts": 0.0}
+POWER_MEMO = 1.0
+
+
+def vm_running_now(ttl=POWER_MEMO):
+    """带短期记忆的「虚拟机现在到底开没开」。
+
+    发现结论是后台线程维护的（没人看时 20 秒才一轮），拿它当开关机态就会
+    出现：虚拟机都关掉了，入口还挂着「正在启动」最长 20 秒，「启动虚拟机」
+    按钮迟迟不出来（1.1.10 修）。开关机态本身很便宜，值得实时确认一次。
+    """
+    now = time.time()
+    v = _power["v"]
+    if v is not None and now - _power["ts"] < ttl:
+        return v
+    v = vm_running()
+    _power.update(v=v, ts=now)
+    return v
+
+
 def platform_sync_start():
     """把应用中心的状态同步成「已启动」。
 
@@ -502,7 +523,9 @@ def _resolve_locked():
     """真正干活的发现链，只在持有 _lock 时调用。返回 dict：
       ip      探活通过、可以直接跳过去的地址（没有就 None）
       source  发现层（mac+arp / mdns / domifaddr / sweep+arp / httpfp）
-      stage   ok / web-warming（找到地址但 80 还没通）/ no-ip（开好了没地址）/ stopped
+      stage   ok / web-warming（找到地址但 80 还没通）/ no-ip（开好了没地址）/
+              stopped（虚拟机没开）/ booting（刚确认开着、地址还没查出来，
+              由 resolve_ip 的开关机态校正临时给出，发现链不产出这个值）
       probing 探活没通过的那个候选地址，纯给排障看
       stale   该候选已经不应答了（ARP/租约残留），此时 stage 是 no-ip 不是 web-warming
 
@@ -578,15 +601,35 @@ def _resolve_locked():
 # 发现结果由后台线程维护，HTTP 请求只读缓存：没地址时入口也能瞬间出画面。
 # ask 是「上一次有人真的来看」的时间戳——没人看的时候把节奏放慢，别空转。
 _last = {"res": None, "ts": 0.0, "ask": 0.0}
+_kick = threading.Event()     # 有人发现开关机态变了，喊后台立刻跑一轮
 DISCOVERY_INTERVAL = 5      # 有人在看：每 5 秒发现一次
 DISCOVERY_IDLE = 20         # 没人看：降到每 20 秒
+
+
+def _power_transition(on_now):
+    """开关机态刚翻转时的过渡结论（只在请求线程里拼，绝不跑发现链）。
+
+    关机方向可以当场断定（没什么可发现的），所以顺手把缓存也改对，
+    入口页下一眼就是「已关机 + 启动虚拟机」；开机方向地址还不知道，
+    先给中立的 booting（页面表现就是「正在启动」），地址交给后台那一轮。
+    """
+    if not on_now:
+        res = {"ip": None, "source": None, "stage": "stopped", "probing": None,
+               "stale": False, "mac": _cache.get("mac")}
+        with _lock:
+            _cache["ip"] = None
+            _last.update(res=res, ts=time.time())
+        return res
+    return {"ip": None, "source": None, "stage": "booting", "probing": None,
+            "stale": False, "mac": _cache.get("mac")}
 
 
 def resolve_ip():
     """入口页与状态接口统一用它：瞬间返回后台发现线程维护的最新结论。
 
     冷启动（一次都还没跑过）才现算一次，避免首页空着。返回的结论最多旧一个
-    发现周期（5 秒），跟入口页自己的轮询节奏一致，用户看不出差别。
+    发现周期（5 秒），跟入口页自己的轮询节奏一致，用户看不出差别——
+    唯独开关机态例外：那个太便宜，值得每次跟虚拟机实际状态对一遍。
     """
     res = _last["res"]
     _last["ask"] = time.time()
@@ -595,6 +638,11 @@ def resolve_ip():
             if _last["res"] is None:
                 _last.update(res=_resolve_locked(), ts=time.time())
             res = _last["res"]
+    else:
+        on_now = vm_running_now()
+        if (res.get("stage") != "stopped") != on_now:
+            _kick.set()             # 让后台发现线程别等到下个周期
+            res = _power_transition(on_now)
     return dict(res) if res else {"ip": None, "source": None, "stage": "no-ip",
                                   "probing": None, "stale": False, "mac": None}
 
@@ -608,10 +656,12 @@ def discovery_loop():
             _last.update(res=res, ts=time.time())
         except Exception:
             pass    # 单轮失败下一轮再来，别把线程搞死
-        # 入口页开着时勤快点，没人看时省点 CPU
+        # 入口页开着时勤快点，没人看时省点 CPU；
+        # 有人看见开关机态变了会 _kick.set()，这里立刻醒过来跑一轮
         gap = (DISCOVERY_INTERVAL
                if time.time() - _last["ask"] < 30 else DISCOVERY_IDLE)
-        time.sleep(gap)
+        _kick.wait(gap)
+        _kick.clear()
 
 
 PAGE_TMPL = """<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">\
@@ -716,8 +766,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         esc = lambda s: (s or "").replace("&", "&amp;").replace("<", "&lt;")
         busy = job["running"]
         stage_cn = {"ok": "就绪", "web-warming": "Web 服务启动中",
-                    "no-ip": "还在获取 IP", "stopped": "虚拟机未开机"}.get(
-                        st["stage"], st["stage"])
+                    "no-ip": "还在获取 IP", "stopped": "虚拟机未开机",
+                    "booting": "系统启动中"}.get(st["stage"], st["stage"])
         p = ['<div><span class="dot%s"></span></div><h1>网络修复</h1>'
              % (" wait" if busy else ""),
              '<p class="mini">下面几步经 libvirt 串口在虚拟机里执行，它没有 IP 也能用。</p>']
@@ -818,13 +868,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 # 简洁关机页 + 一键开机按钮（点了才开，开了自动跳）。
                 btn = ('<form method="POST" action="/power/start">'
                        '<button type="submit">启动虚拟机</button></form>')
-                self._send(200, self._page("iStoreOS 已关机", btn, refresh=5))
+                self._send(200, self._page("iStoreOS 已关机", btn, refresh=3))
                 return
             # 不是用户关的（应用重启、虚拟机里手动关机等）：打开入口就顺手补开机。
             # 应用中心的「启用」不会回调应用脚本（实测 cmd/main 只收到 stop）。
             vm_power_on()
             self._send(200, self._page(
-                "正在启动", "iStoreOS 就绪后会自动打开。", refresh=5, dot="wait"))
+                "正在启动", "iStoreOS 就绪后会自动打开。", refresh=3, dot="wait"))
+            return
+        if r["stage"] == "booting":
+            # 刚确认虚拟机开着、地址还等后台那一轮：给中立的「正在启动」，
+            # 这时说「路由器 DHCP 没发地址」为时过早。
+            self._send(200, self._page(
+                "正在启动", "iStoreOS 就绪后会自动打开。", refresh=3, dot="wait"))
             return
         if r["stage"] == "web-warming":
             self._send(200, self._page(
